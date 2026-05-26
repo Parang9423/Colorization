@@ -31,16 +31,11 @@ def rgb_to_gray(img_rgb: np.ndarray) -> np.ndarray:
 def resize_for_preview(img: np.ndarray, max_width: int) -> np.ndarray:
     if max_width <= 0:
         return img
-
     h, w = img.shape[:2]
     if w <= max_width:
         return img
-
     scale = max_width / w
-    new_w = max_width
-    new_h = max(1, int(h * scale))
-    interpolation = cv2.INTER_AREA
-    return cv2.resize(img, (new_w, new_h), interpolation=interpolation)
+    return cv2.resize(img, (max_width, max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
 
 
 def apply_gamma_float(gray_float: np.ndarray, gamma: float) -> np.ndarray:
@@ -61,7 +56,6 @@ def get_roi_bounds(img_shape, roi: Optional[Tuple[int, int, int, int]]):
     h_img, w_img = img_shape[:2]
     if roi is None:
         return 0, 0, w_img, h_img
-
     x, y, w, h = roi
     x = int(np.clip(x, 0, w_img - 1))
     y = int(np.clip(y, 0, h_img - 1))
@@ -70,18 +64,7 @@ def get_roi_bounds(img_shape, roi: Optional[Tuple[int, int, int, int]]):
     return x, y, w, h
 
 
-def grayscale_to_rgb_colorize(
-    original_rgb: np.ndarray,
-    base_rgb: Tuple[int, int, int],
-    r_scale: float,
-    g_scale: float,
-    b_scale: float,
-    gamma: float,
-    contrast: float,
-    intensity: float,
-    saturation: float,
-    roi: Optional[Tuple[int, int, int, int]] = None,
-) -> np.ndarray:
+def grayscale_to_rgb_colorize(original_rgb, base_rgb, r_scale, g_scale, b_scale, gamma, contrast, intensity, saturation, roi=None):
     gray = rgb_to_gray(original_rgb).astype(np.float32) / 255.0
     gray = apply_contrast(gray, contrast)
     gray = apply_gamma_float(gray, gamma)
@@ -90,10 +73,9 @@ def grayscale_to_rgb_colorize(
     channel_scale = np.array([r_scale, g_scale, b_scale], dtype=np.float32)
     color_vector = np.clip(base * channel_scale, 0.0, 1.0)
 
-    colorized = gray[..., None] * color_vector[None, None, :] * intensity
-    colorized = np.clip(colorized, 0.0, 1.0)
-
+    colorized = np.clip(gray[..., None] * color_vector[None, None, :] * intensity, 0.0, 1.0)
     colorized_u8 = (colorized * 255).astype(np.uint8)
+
     hsv = cv2.cvtColor(colorized_u8, cv2.COLOR_RGB2HSV)
     h_ch, s_ch, v_ch = cv2.split(hsv)
     s_ch = np.clip(s_ch.astype(np.float32) * saturation, 0, 255).astype(np.uint8)
@@ -105,75 +87,46 @@ def grayscale_to_rgb_colorize(
     return result
 
 
-def adjust_hsv_region(
-    img_rgb: np.ndarray,
-    hue_shift: int,
-    saturation_scale: float,
-    value_scale: float,
-    gamma: float,
-    roi: Optional[Tuple[int, int, int, int]] = None,
-) -> np.ndarray:
+def adjust_hsv_region(img_rgb, hue_shift, saturation_scale, value_scale, gamma, roi=None):
     result = img_rgb.copy()
     x, y, w, h = get_roi_bounds(img_rgb.shape, roi)
-
     region = result[y:y + h, x:x + w]
+
     hsv = cv2.cvtColor(region, cv2.COLOR_RGB2HSV)
     h_ch, s_ch, v_ch = cv2.split(hsv)
-
     h_ch = ((h_ch.astype(np.int16) + hue_shift) % 180).astype(np.uint8)
     s_ch = np.clip(s_ch.astype(np.float32) * saturation_scale, 0, 255).astype(np.uint8)
     v_float = np.clip(v_ch.astype(np.float32) * value_scale / 255.0, 0, 1)
     v_ch = (apply_gamma_float(v_float, gamma) * 255).astype(np.uint8)
 
-    adjusted_rgb = cv2.cvtColor(cv2.merge([h_ch, s_ch, v_ch]), cv2.COLOR_HSV2RGB)
-    result[y:y + h, x:x + w] = adjusted_rgb
+    result[y:y + h, x:x + w] = cv2.cvtColor(cv2.merge([h_ch, s_ch, v_ch]), cv2.COLOR_HSV2RGB)
     return result
 
 
 def load_images_from_uploads(uploaded_files) -> List[Dict]:
     images = []
-
     for uploaded_file in uploaded_files:
         name = uploaded_file.name
         lower_name = name.lower()
-
         if lower_name.endswith(".zip"):
-            zip_bytes = io.BytesIO(uploaded_file.getvalue())
-            with zipfile.ZipFile(zip_bytes, "r") as zf:
+            with zipfile.ZipFile(io.BytesIO(uploaded_file.getvalue()), "r") as zf:
                 for member in zf.namelist():
                     if member.lower().endswith(IMAGE_EXTENSIONS) and not member.endswith("/"):
                         with zf.open(member) as fp:
-                            pil_img = Image.open(fp)
-                            images.append({"name": os.path.basename(member), "rgb": pil_to_rgb(pil_img)})
+                            images.append({"name": os.path.basename(member), "rgb": pil_to_rgb(Image.open(fp))})
         elif lower_name.endswith(IMAGE_EXTENSIONS):
-            pil_img = Image.open(uploaded_file)
-            images.append({"name": name, "rgb": pil_to_rgb(pil_img)})
-
+            images.append({"name": name, "rgb": pil_to_rgb(Image.open(uploaded_file))})
     return images
 
 
 def process_image(img_rgb: np.ndarray, params: dict, roi=None) -> np.ndarray:
     if params["process_mode"] == "Grayscale → RGB Colorize":
         return grayscale_to_rgb_colorize(
-            original_rgb=img_rgb,
-            base_rgb=params["base_rgb"],
-            r_scale=params["r_scale"],
-            g_scale=params["g_scale"],
-            b_scale=params["b_scale"],
-            gamma=params["gamma"],
-            contrast=params["contrast"],
-            intensity=params["intensity"],
-            saturation=params["saturation"],
-            roi=roi,
+            img_rgb, params["base_rgb"], params["r_scale"], params["g_scale"], params["b_scale"],
+            params["gamma"], params["contrast"], params["intensity"], params["saturation"], roi
         )
-
     return adjust_hsv_region(
-        img_rgb=img_rgb,
-        hue_shift=params["hue_shift"],
-        saturation_scale=params["saturation_scale"],
-        value_scale=params["value_scale"],
-        gamma=params["gamma"],
-        roi=roi,
+        img_rgb, params["hue_shift"], params["saturation_scale"], params["value_scale"], params["gamma"], roi
     )
 
 
@@ -203,8 +156,7 @@ def render_gallery(results: List[Dict], preview_count: int, columns_per_row: int
             for col, item in zip(cols, visible_results[start:start + columns_per_row]):
                 with col:
                     st.caption(item["name"])
-                    preview = resize_for_preview(item["adjusted_rgb"], preview_width)
-                    st.image(preview, use_container_width=False)
+                    st.image(resize_for_preview(item["adjusted_rgb"], preview_width), use_container_width=False)
         return
 
     if layout_mode == "원본/결과 2열 비교":
@@ -227,8 +179,7 @@ def render_gallery(results: List[Dict], preview_count: int, columns_per_row: int
             st.image(resize_for_preview(item["original_rgb"], preview_width), use_container_width=False)
         with center:
             st.caption("Grayscale")
-            gray = rgb_to_gray(item["original_rgb"])
-            st.image(resize_for_preview(gray, preview_width), use_container_width=False, clamp=True)
+            st.image(resize_for_preview(rgb_to_gray(item["original_rgb"]), preview_width), use_container_width=False, clamp=True)
         with right:
             st.caption("Adjusted RGB")
             st.image(resize_for_preview(item["adjusted_rgb"], preview_width), use_container_width=False)
@@ -248,7 +199,6 @@ if not uploaded_files:
     st.stop()
 
 images = load_images_from_uploads(uploaded_files)
-
 if not images:
     st.warning("처리 가능한 이미지가 없습니다.")
     st.stop()
@@ -258,7 +208,6 @@ height, width = first_rgb.shape[:2]
 
 st.sidebar.header("모드")
 process_mode = st.sidebar.radio("처리 방식", ["Grayscale → RGB Colorize", "RGB HSV Adjust"])
-
 st.sidebar.header("적용 범위")
 apply_mode = st.sidebar.radio("적용 범위", ["전체 이미지", "ROI 영역"])
 
@@ -277,7 +226,6 @@ if process_mode == "Grayscale → RGB Colorize":
     st.sidebar.header("RGB 컬러라이징")
     base_color = st.sidebar.color_picker("Base Color", "#C8A070")
     base_rgb = hex_to_rgb(base_color)
-
     params.update({
         "base_color": base_color,
         "base_rgb": base_rgb,
@@ -298,31 +246,33 @@ else:
         "gamma": st.sidebar.slider("Gamma", 0.1, 3.0, 1.0, 0.05),
     })
 
-st.sidebar.header("Preview UI")
-layout_mode = st.sidebar.radio(
-    "Preview Layout",
-    ["결과만 갤러리", "원본/결과 2열 비교", "원본/흑백/결과 3열 비교"],
-)
-columns_per_row = st.sidebar.slider("Columns per Row", 2, 8, 4)
-preview_width = st.sidebar.slider("Preview Image Width(px)", 80, 500, 220, 20)
-max_preview_limit = min(len(images), 100)
-preview_count = st.sidebar.slider("Preview Count", 1, max_preview_limit, min(max_preview_limit, 12))
-
 results = []
 for item in images:
     adjusted = process_image(item["rgb"], params, roi=roi)
     results.append({"name": item["name"], "original_rgb": item["rgb"], "adjusted_rgb": adjusted})
 
 st.subheader("Batch Preview")
-st.write(f"처리 이미지 수: **{len(results)}** / 미리보기: **{preview_count}**")
+st.write(f"처리 이미지 수: **{len(results)}**")
 
-render_gallery(
-    results=results,
-    preview_count=preview_count,
-    columns_per_row=columns_per_row,
-    preview_width=preview_width,
-    layout_mode=layout_mode,
-)
+with st.expander("Preview UI 설정", expanded=True):
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        layout_mode = st.selectbox(
+            "Preview Layout",
+            ["결과만 갤러리", "원본/결과 2열 비교", "원본/흑백/결과 3열 비교"],
+            index=0,
+        )
+    with c2:
+        columns_per_row = st.slider("Columns per Row", 2, 8, 4)
+    with c3:
+        preview_width = st.slider("Preview Image Width(px)", 80, 500, 180, 20)
+    with c4:
+        max_preview_limit = min(len(results), 100)
+        preview_count = st.slider("Preview Count", 1, max_preview_limit, min(max_preview_limit, 12))
+
+st.write(f"미리보기: **{preview_count}** / Layout: **{layout_mode}** / Width: **{preview_width}px**")
+
+render_gallery(results, preview_count, columns_per_row, preview_width, layout_mode)
 
 with st.expander("보정 파라미터 보기"):
     st.json(params)
@@ -345,8 +295,7 @@ if st.button("로컬 outputs 폴더에 저장"):
 
     for item in results:
         stem, _ = os.path.splitext(item["name"])
-        out_path = os.path.join(colorized_dir, f"{stem}_colorized.png")
-        cv2.imwrite(out_path, rgb_to_bgr(item["adjusted_rgb"]))
+        cv2.imwrite(os.path.join(colorized_dir, f"{stem}_colorized.png"), rgb_to_bgr(item["adjusted_rgb"]))
 
     with open(os.path.join(run_dir, "params.json"), "w", encoding="utf-8") as f:
         json.dump(params, f, ensure_ascii=False, indent=2)
