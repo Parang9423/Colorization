@@ -28,6 +28,21 @@ def rgb_to_gray(img_rgb: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
 
 
+def resize_for_preview(img: np.ndarray, max_width: int) -> np.ndarray:
+    if max_width <= 0:
+        return img
+
+    h, w = img.shape[:2]
+    if w <= max_width:
+        return img
+
+    scale = max_width / w
+    new_w = max_width
+    new_h = max(1, int(h * scale))
+    interpolation = cv2.INTER_AREA
+    return cv2.resize(img, (new_w, new_h), interpolation=interpolation)
+
+
 def apply_gamma_float(gray_float: np.ndarray, gamma: float) -> np.ndarray:
     gamma = max(gamma, 0.01)
     return np.power(np.clip(gray_float, 0.0, 1.0), gamma)
@@ -129,16 +144,10 @@ def load_images_from_uploads(uploaded_files) -> List[Dict]:
                     if member.lower().endswith(IMAGE_EXTENSIONS) and not member.endswith("/"):
                         with zf.open(member) as fp:
                             pil_img = Image.open(fp)
-                            images.append({
-                                "name": os.path.basename(member),
-                                "rgb": pil_to_rgb(pil_img),
-                            })
+                            images.append({"name": os.path.basename(member), "rgb": pil_to_rgb(pil_img)})
         elif lower_name.endswith(IMAGE_EXTENSIONS):
             pil_img = Image.open(uploaded_file)
-            images.append({
-                "name": name,
-                "rgb": pil_to_rgb(pil_img),
-            })
+            images.append({"name": name, "rgb": pil_to_rgb(pil_img)})
 
     return images
 
@@ -185,6 +194,46 @@ def make_result_zip(results: List[Dict], params: dict) -> bytes:
     return zip_buffer.getvalue()
 
 
+def render_gallery(results: List[Dict], preview_count: int, columns_per_row: int, preview_width: int, layout_mode: str):
+    visible_results = results[:preview_count]
+
+    if layout_mode == "결과만 갤러리":
+        for start in range(0, len(visible_results), columns_per_row):
+            cols = st.columns(columns_per_row)
+            for col, item in zip(cols, visible_results[start:start + columns_per_row]):
+                with col:
+                    st.caption(item["name"])
+                    preview = resize_for_preview(item["adjusted_rgb"], preview_width)
+                    st.image(preview, use_container_width=False)
+        return
+
+    if layout_mode == "원본/결과 2열 비교":
+        for item in visible_results:
+            st.markdown(f"#### {item['name']}")
+            left, right = st.columns(2)
+            with left:
+                st.caption("Original")
+                st.image(resize_for_preview(item["original_rgb"], preview_width), use_container_width=False)
+            with right:
+                st.caption("Adjusted RGB")
+                st.image(resize_for_preview(item["adjusted_rgb"], preview_width), use_container_width=False)
+        return
+
+    for item in visible_results:
+        st.markdown(f"#### {item['name']}")
+        left, center, right = st.columns(3)
+        with left:
+            st.caption("Original")
+            st.image(resize_for_preview(item["original_rgb"], preview_width), use_container_width=False)
+        with center:
+            st.caption("Grayscale")
+            gray = rgb_to_gray(item["original_rgb"])
+            st.image(resize_for_preview(gray, preview_width), use_container_width=False, clamp=True)
+        with right:
+            st.caption("Adjusted RGB")
+            st.image(resize_for_preview(item["adjusted_rgb"], preview_width), use_container_width=False)
+
+
 st.set_page_config(page_title="Colorization Palette Tool", layout="wide")
 st.title("Colorization Palette & Gamma Tool")
 
@@ -208,10 +257,7 @@ first_rgb = images[0]["rgb"]
 height, width = first_rgb.shape[:2]
 
 st.sidebar.header("모드")
-process_mode = st.sidebar.radio(
-    "처리 방식",
-    ["Grayscale → RGB Colorize", "RGB HSV Adjust"],
-)
+process_mode = st.sidebar.radio("처리 방식", ["Grayscale → RGB Colorize", "RGB HSV Adjust"])
 
 st.sidebar.header("적용 범위")
 apply_mode = st.sidebar.radio("적용 범위", ["전체 이미지", "ROI 영역"])
@@ -252,31 +298,34 @@ else:
         "gamma": st.sidebar.slider("Gamma", 0.1, 3.0, 1.0, 0.05),
     })
 
+st.sidebar.header("Preview UI")
+layout_mode = st.sidebar.radio(
+    "Preview Layout",
+    ["결과만 갤러리", "원본/결과 2열 비교", "원본/흑백/결과 3열 비교"],
+)
+columns_per_row = st.sidebar.slider("Columns per Row", 2, 8, 4)
+preview_width = st.sidebar.slider("Preview Image Width(px)", 80, 500, 220, 20)
+max_preview_limit = min(len(images), 100)
+preview_count = st.sidebar.slider("Preview Count", 1, max_preview_limit, min(max_preview_limit, 12))
+
 results = []
 for item in images:
     adjusted = process_image(item["rgb"], params, roi=roi)
     results.append({"name": item["name"], "original_rgb": item["rgb"], "adjusted_rgb": adjusted})
 
 st.subheader("Batch Preview")
-st.write(f"처리 이미지 수: **{len(results)}**")
+st.write(f"처리 이미지 수: **{len(results)}** / 미리보기: **{preview_count}**")
 
-preview_count = st.slider("미리보기 이미지 수", 1, min(len(results), 20), min(len(results), 6))
+render_gallery(
+    results=results,
+    preview_count=preview_count,
+    columns_per_row=columns_per_row,
+    preview_width=preview_width,
+    layout_mode=layout_mode,
+)
 
-for item in results[:preview_count]:
-    st.markdown(f"### {item['name']}")
-    left, center, right = st.columns(3)
-    with left:
-        st.caption("Original")
-        st.image(item["original_rgb"], use_container_width=True)
-    with center:
-        st.caption("Grayscale")
-        st.image(rgb_to_gray(item["original_rgb"]), use_container_width=True, clamp=True)
-    with right:
-        st.caption("Adjusted RGB")
-        st.image(item["adjusted_rgb"], use_container_width=True)
-
-st.subheader("보정 파라미터")
-st.json(params)
+with st.expander("보정 파라미터 보기"):
+    st.json(params)
 
 zip_bytes = make_result_zip(results, params)
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
