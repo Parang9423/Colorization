@@ -1,7 +1,9 @@
+import io
 import json
 import os
+import zipfile
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -11,6 +13,8 @@ from PIL import Image
 SAVE_DIR = "outputs"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
 
 def pil_to_rgb(pil_img: Image.Image) -> np.ndarray:
     return np.array(pil_img.convert("RGB"))
@@ -18,10 +22,6 @@ def pil_to_rgb(pil_img: Image.Image) -> np.ndarray:
 
 def rgb_to_bgr(img_rgb: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-
-
-def bgr_to_rgb(img_bgr: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
 
 def rgb_to_gray(img_rgb: np.ndarray) -> np.ndarray:
@@ -34,7 +34,6 @@ def apply_gamma_float(gray_float: np.ndarray, gamma: float) -> np.ndarray:
 
 
 def apply_contrast(gray_float: np.ndarray, contrast: float) -> np.ndarray:
-    # contrast=1.0: 원본 유지
     return np.clip((gray_float - 0.5) * contrast + 0.5, 0.0, 1.0)
 
 
@@ -47,7 +46,13 @@ def get_roi_bounds(img_shape, roi: Optional[Tuple[int, int, int, int]]):
     h_img, w_img = img_shape[:2]
     if roi is None:
         return 0, 0, w_img, h_img
-    return roi
+
+    x, y, w, h = roi
+    x = int(np.clip(x, 0, w_img - 1))
+    y = int(np.clip(y, 0, h_img - 1))
+    w = int(np.clip(w, 1, w_img - x))
+    h = int(np.clip(h, 1, h_img - y))
+    return x, y, w, h
 
 
 def grayscale_to_rgb_colorize(
@@ -62,7 +67,6 @@ def grayscale_to_rgb_colorize(
     saturation: float,
     roi: Optional[Tuple[int, int, int, int]] = None,
 ) -> np.ndarray:
-    """흑백 luminance를 기반으로 3채널 RGB 이미지를 생성한다."""
     gray = rgb_to_gray(original_rgb).astype(np.float32) / 255.0
     gray = apply_contrast(gray, contrast)
     gray = apply_gamma_float(gray, gamma)
@@ -74,7 +78,6 @@ def grayscale_to_rgb_colorize(
     colorized = gray[..., None] * color_vector[None, None, :] * intensity
     colorized = np.clip(colorized, 0.0, 1.0)
 
-    # saturation 조절을 위해 HSV에서 S 채널만 배율 적용
     colorized_u8 = (colorized * 255).astype(np.uint8)
     hsv = cv2.cvtColor(colorized_u8, cv2.COLOR_RGB2HSV)
     h_ch, s_ch, v_ch = cv2.split(hsv)
@@ -112,34 +115,97 @@ def adjust_hsv_region(
     return result
 
 
-def save_result(img_rgb: np.ndarray, params: dict):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    image_path = os.path.join(SAVE_DIR, f"colorized_{timestamp}.png")
-    json_path = os.path.join(SAVE_DIR, f"params_{timestamp}.json")
+def load_images_from_uploads(uploaded_files) -> List[Dict]:
+    images = []
 
-    cv2.imwrite(image_path, rgb_to_bgr(img_rgb))
+    for uploaded_file in uploaded_files:
+        name = uploaded_file.name
+        lower_name = name.lower()
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(params, f, ensure_ascii=False, indent=2)
+        if lower_name.endswith(".zip"):
+            zip_bytes = io.BytesIO(uploaded_file.getvalue())
+            with zipfile.ZipFile(zip_bytes, "r") as zf:
+                for member in zf.namelist():
+                    if member.lower().endswith(IMAGE_EXTENSIONS) and not member.endswith("/"):
+                        with zf.open(member) as fp:
+                            pil_img = Image.open(fp)
+                            images.append({
+                                "name": os.path.basename(member),
+                                "rgb": pil_to_rgb(pil_img),
+                            })
+        elif lower_name.endswith(IMAGE_EXTENSIONS):
+            pil_img = Image.open(uploaded_file)
+            images.append({
+                "name": name,
+                "rgb": pil_to_rgb(pil_img),
+            })
 
-    return image_path, json_path
+    return images
+
+
+def process_image(img_rgb: np.ndarray, params: dict, roi=None) -> np.ndarray:
+    if params["process_mode"] == "Grayscale → RGB Colorize":
+        return grayscale_to_rgb_colorize(
+            original_rgb=img_rgb,
+            base_rgb=params["base_rgb"],
+            r_scale=params["r_scale"],
+            g_scale=params["g_scale"],
+            b_scale=params["b_scale"],
+            gamma=params["gamma"],
+            contrast=params["contrast"],
+            intensity=params["intensity"],
+            saturation=params["saturation"],
+            roi=roi,
+        )
+
+    return adjust_hsv_region(
+        img_rgb=img_rgb,
+        hue_shift=params["hue_shift"],
+        saturation_scale=params["saturation_scale"],
+        value_scale=params["value_scale"],
+        gamma=params["gamma"],
+        roi=roi,
+    )
+
+
+def image_to_png_bytes(img_rgb: np.ndarray) -> bytes:
+    buffer = io.BytesIO()
+    Image.fromarray(img_rgb).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def make_result_zip(results: List[Dict], params: dict) -> bytes:
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item in results:
+            stem, _ = os.path.splitext(item["name"])
+            zf.writestr(f"colorized/{stem}_colorized.png", image_to_png_bytes(item["adjusted_rgb"]))
+        zf.writestr("params.json", json.dumps(params, ensure_ascii=False, indent=2))
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
 
 
 st.set_page_config(page_title="Colorization Palette Tool", layout="wide")
 st.title("Colorization Palette & Gamma Tool")
 
-uploaded_file = st.file_uploader(
-    "이미지를 업로드하세요",
-    type=["png", "jpg", "jpeg", "bmp", "tif", "tiff"],
+uploaded_files = st.file_uploader(
+    "이미지를 업로드하세요. 여러 이미지 또는 ZIP 업로드 가능",
+    type=["png", "jpg", "jpeg", "bmp", "tif", "tiff", "zip"],
+    accept_multiple_files=True,
 )
 
-if uploaded_file is None:
-    st.info("흑백 이미지를 업로드하면 3채널 RGB 컬러 이미지 생성 UI가 표시됩니다.")
+if not uploaded_files:
+    st.info("흑백 이미지 여러 장 또는 이미지가 들어있는 ZIP 파일을 업로드하세요.")
     st.stop()
 
-pil_img = Image.open(uploaded_file)
-original_rgb = pil_to_rgb(pil_img)
-height, width = original_rgb.shape[:2]
+images = load_images_from_uploads(uploaded_files)
+
+if not images:
+    st.warning("처리 가능한 이미지가 없습니다.")
+    st.stop()
+
+first_rgb = images[0]["rgb"]
+height, width = first_rgb.shape[:2]
 
 st.sidebar.header("모드")
 process_mode = st.sidebar.radio(
@@ -152,108 +218,88 @@ apply_mode = st.sidebar.radio("적용 범위", ["전체 이미지", "ROI 영역"
 
 roi = None
 if apply_mode == "ROI 영역":
-    st.sidebar.subheader("ROI 설정")
+    st.sidebar.caption("ROI는 첫 번째 이미지 크기 기준으로 적용됩니다. 서로 크기가 다른 이미지는 범위가 자동 보정됩니다.")
     x = st.sidebar.slider("X", 0, width - 1, 0)
     y = st.sidebar.slider("Y", 0, height - 1, 0)
     w = st.sidebar.slider("Width", 1, width - x, width - x)
     h = st.sidebar.slider("Height", 1, height - y, height - y)
     roi = (x, y, w, h)
 
+params = {"process_mode": process_mode, "apply_mode": apply_mode, "roi": roi}
+
 if process_mode == "Grayscale → RGB Colorize":
     st.sidebar.header("RGB 컬러라이징")
-
     base_color = st.sidebar.color_picker("Base Color", "#C8A070")
     base_rgb = hex_to_rgb(base_color)
 
-    r_scale = st.sidebar.slider("R Scale", 0.0, 3.0, 1.0, 0.05)
-    g_scale = st.sidebar.slider("G Scale", 0.0, 3.0, 1.0, 0.05)
-    b_scale = st.sidebar.slider("B Scale", 0.0, 3.0, 1.0, 0.05)
-
-    intensity = st.sidebar.slider("Color Intensity", 0.0, 3.0, 1.0, 0.05)
-    saturation = st.sidebar.slider("Saturation", 0.0, 3.0, 1.0, 0.05)
-    contrast = st.sidebar.slider("Contrast", 0.1, 3.0, 1.0, 0.05)
-    gamma = st.sidebar.slider("Gamma", 0.1, 3.0, 1.0, 0.05)
-
-    adjusted_rgb = grayscale_to_rgb_colorize(
-        original_rgb=original_rgb,
-        base_rgb=base_rgb,
-        r_scale=r_scale,
-        g_scale=g_scale,
-        b_scale=b_scale,
-        gamma=gamma,
-        contrast=contrast,
-        intensity=intensity,
-        saturation=saturation,
-        roi=roi,
-    )
-
-    params = {
-        "source_file": uploaded_file.name,
-        "process_mode": process_mode,
-        "apply_mode": apply_mode,
-        "roi": roi,
-        "adjustment": {
-            "base_color": base_color,
-            "base_rgb": base_rgb,
-            "r_scale": r_scale,
-            "g_scale": g_scale,
-            "b_scale": b_scale,
-            "intensity": intensity,
-            "saturation": saturation,
-            "contrast": contrast,
-            "gamma": gamma,
-        },
-    }
+    params.update({
+        "base_color": base_color,
+        "base_rgb": base_rgb,
+        "r_scale": st.sidebar.slider("R Scale", 0.0, 3.0, 1.0, 0.05),
+        "g_scale": st.sidebar.slider("G Scale", 0.0, 3.0, 1.0, 0.05),
+        "b_scale": st.sidebar.slider("B Scale", 0.0, 3.0, 1.0, 0.05),
+        "intensity": st.sidebar.slider("Color Intensity", 0.0, 3.0, 1.0, 0.05),
+        "saturation": st.sidebar.slider("Saturation", 0.0, 3.0, 1.0, 0.05),
+        "contrast": st.sidebar.slider("Contrast", 0.1, 3.0, 1.0, 0.05),
+        "gamma": st.sidebar.slider("Gamma", 0.1, 3.0, 1.0, 0.05),
+    })
 else:
     st.sidebar.header("HSV / Gamma 조절")
+    params.update({
+        "hue_shift": st.sidebar.slider("Hue Shift", -90, 90, 0),
+        "saturation_scale": st.sidebar.slider("Saturation Scale", 0.0, 3.0, 1.0, 0.05),
+        "value_scale": st.sidebar.slider("Value Scale", 0.0, 3.0, 1.0, 0.05),
+        "gamma": st.sidebar.slider("Gamma", 0.1, 3.0, 1.0, 0.05),
+    })
 
-    hue_shift = st.sidebar.slider("Hue Shift", -90, 90, 0)
-    saturation_scale = st.sidebar.slider("Saturation Scale", 0.0, 3.0, 1.0, 0.05)
-    value_scale = st.sidebar.slider("Value Scale", 0.0, 3.0, 1.0, 0.05)
-    gamma = st.sidebar.slider("Gamma", 0.1, 3.0, 1.0, 0.05)
+results = []
+for item in images:
+    adjusted = process_image(item["rgb"], params, roi=roi)
+    results.append({"name": item["name"], "original_rgb": item["rgb"], "adjusted_rgb": adjusted})
 
-    adjusted_rgb = adjust_hsv_region(
-        img_rgb=original_rgb,
-        hue_shift=hue_shift,
-        saturation_scale=saturation_scale,
-        value_scale=value_scale,
-        gamma=gamma,
-        roi=roi,
-    )
+st.subheader("Batch Preview")
+st.write(f"처리 이미지 수: **{len(results)}**")
 
-    params = {
-        "source_file": uploaded_file.name,
-        "process_mode": process_mode,
-        "apply_mode": apply_mode,
-        "roi": roi,
-        "adjustment": {
-            "hue_shift": hue_shift,
-            "saturation_scale": saturation_scale,
-            "value_scale": value_scale,
-            "gamma": gamma,
-        },
-    }
+preview_count = st.slider("미리보기 이미지 수", 1, min(len(results), 20), min(len(results), 6))
 
-left, center, right = st.columns(3)
-
-with left:
-    st.subheader("Original")
-    st.image(original_rgb, use_container_width=True)
-
-with center:
-    st.subheader("Grayscale Input")
-    gray_preview = rgb_to_gray(original_rgb)
-    st.image(gray_preview, use_container_width=True, clamp=True)
-
-with right:
-    st.subheader("Adjusted RGB")
-    st.image(adjusted_rgb, use_container_width=True)
+for item in results[:preview_count]:
+    st.markdown(f"### {item['name']}")
+    left, center, right = st.columns(3)
+    with left:
+        st.caption("Original")
+        st.image(item["original_rgb"], use_container_width=True)
+    with center:
+        st.caption("Grayscale")
+        st.image(rgb_to_gray(item["original_rgb"]), use_container_width=True, clamp=True)
+    with right:
+        st.caption("Adjusted RGB")
+        st.image(item["adjusted_rgb"], use_container_width=True)
 
 st.subheader("보정 파라미터")
 st.json(params)
 
-if st.button("결과 저장"):
-    image_path, json_path = save_result(adjusted_rgb, params)
-    st.success("저장 완료")
-    st.write(f"이미지 저장 경로: `{image_path}`")
-    st.write(f"JSON 저장 경로: `{json_path}`")
+zip_bytes = make_result_zip(results, params)
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+st.download_button(
+    label="결과 ZIP 다운로드",
+    data=zip_bytes,
+    file_name=f"colorized_results_{timestamp}.zip",
+    mime="application/zip",
+)
+
+if st.button("로컬 outputs 폴더에 저장"):
+    run_dir = os.path.join(SAVE_DIR, f"batch_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+    colorized_dir = os.path.join(run_dir, "colorized")
+    os.makedirs(colorized_dir, exist_ok=True)
+
+    for item in results:
+        stem, _ = os.path.splitext(item["name"])
+        out_path = os.path.join(colorized_dir, f"{stem}_colorized.png")
+        cv2.imwrite(out_path, rgb_to_bgr(item["adjusted_rgb"]))
+
+    with open(os.path.join(run_dir, "params.json"), "w", encoding="utf-8") as f:
+        json.dump(params, f, ensure_ascii=False, indent=2)
+
+    st.success(f"저장 완료: {run_dir}")
