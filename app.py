@@ -31,6 +31,13 @@ def resize_keep_ratio(img: np.ndarray, width: int) -> np.ndarray:
     return cv2.resize(img, (width, new_h), interpolation=cv2.INTER_AREA)
 
 
+def single_or_slider(label: str, min_value: int, max_value: int, default_value: int, key: str | None = None) -> int:
+    if max_value <= min_value:
+        st.caption(f"{label}: {min_value}")
+        return min_value
+    return st.slider(label, min_value, max_value, min(default_value, max_value), key=key)
+
+
 def build_colorization_params() -> Dict:
     st.sidebar.header("Colorization Params")
 
@@ -147,7 +154,13 @@ def render_colorization_tab(results: List[Dict], params: Dict):
         with c3:
             preview_width = st.slider("Preview Card Width(px)", 80, 900, 220, 20)
         with c4:
-            preview_count = st.slider("Preview Count", 1, len(results), min(len(results), 12))
+            preview_count = single_or_slider(
+                "Preview Count",
+                1,
+                len(results),
+                min(len(results), 12),
+                key="color_preview_count",
+            )
 
     render_gallery(results, preview_mode, preview_count, columns_per_row, preview_width)
 
@@ -228,7 +241,13 @@ def render_evaluation_tab(results: List[Dict]):
     st.write("- Delta E: 낮을수록 LAB 시각 색상 거리 작음")
     st.write("- PSNR: 높을수록 픽셀 단위 차이가 작음")
 
-    preview_count = st.slider("Evaluation Preview Count", 1, len(matched), min(len(matched), 6))
+    preview_count = single_or_slider(
+        "Evaluation Preview Count",
+        1,
+        len(matched),
+        min(len(matched), 6),
+        key="eval_preview_count",
+    )
     for item in matched[:preview_count]:
         st.markdown(f"#### {item['name']}")
         c1, c2, c3 = st.columns(3)
