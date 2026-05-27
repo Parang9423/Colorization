@@ -1,10 +1,14 @@
+import io
+import json
 import os
+import zipfile
 from datetime import datetime
 from typing import Dict, List
 
 import cv2
 import numpy as np
 import streamlit as st
+from PIL import Image
 
 from src.colorization import grayscale_to_rgb_colorize, rgb_to_gray
 from src.dataset_qa import calculate_image_stats, detect_saturation_outliers, summarize_dataset
@@ -38,13 +42,49 @@ def single_or_slider(label: str, min_value: int, max_value: int, default_value: 
     return st.slider(label, min_value, max_value, min(default_value, max_value), key=key)
 
 
+def gray_to_png_bytes(gray: np.ndarray) -> bytes:
+    buffer = io.BytesIO()
+    Image.fromarray(gray).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def make_grayscale_zip(results: List[Dict]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item in results:
+            stem = os.path.splitext(item["name"])[0]
+            zf.writestr(f"grayscale/{stem}.png", gray_to_png_bytes(item["gray"]))
+        zf.writestr(
+            "params.json",
+            json.dumps({"mode": "RGB → Grayscale", "filename_policy": "keep_original_stem"}, ensure_ascii=False, indent=2),
+        )
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def save_grayscale_to_local(results: List[Dict]) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(SAVE_DIR, f"grayscale_{timestamp}")
+    gray_dir = os.path.join(run_dir, "grayscale")
+    os.makedirs(gray_dir, exist_ok=True)
+
+    for item in results:
+        stem = os.path.splitext(item["name"])[0]
+        cv2.imwrite(os.path.join(gray_dir, f"{stem}.png"), item["gray"])
+
+    with open(os.path.join(run_dir, "params.json"), "w", encoding="utf-8") as f:
+        json.dump({"mode": "RGB → Grayscale", "filename_policy": "keep_original_stem"}, f, ensure_ascii=False, indent=2)
+
+    return run_dir
+
+
 def build_colorization_params() -> Dict:
     st.sidebar.header("Colorization Params")
 
     base_color = st.sidebar.color_picker("Base Color", "#C8A070")
     base_rgb = hex_to_rgb(base_color)
 
-    params = {
+    return {
         "mode": "Grayscale → RGB Colorize",
         "base_color": base_color,
         "base_rgb": base_rgb,
@@ -56,8 +96,6 @@ def build_colorization_params() -> Dict:
         "contrast": st.sidebar.slider("Contrast", 0.1, 3.0, 1.0, 0.05),
         "gamma": st.sidebar.slider("Gamma", 0.1, 3.0, 1.0, 0.05),
     }
-
-    return params
 
 
 def process_images(images: List[Dict], params: Dict) -> List[Dict]:
@@ -135,6 +173,48 @@ def render_gallery(results: List[Dict], mode: str, preview_count: int, columns_p
         for col, item in zip(cols, row_items):
             with col:
                 render_card(item, mode, preview_width)
+
+
+def render_grayscale_tab(results: List[Dict]):
+    st.subheader("Grayscale Export")
+    st.write("메인 업로드의 실사 RGB 이미지를 1채널 Grayscale 이미지로 변환해 저장합니다.")
+    st.write("파일명 stem은 원본과 동일하게 유지됩니다. 예: `sample_001.jpg` → `sample_001.png`")
+
+    with st.expander("Preview UI 설정", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            columns_per_row = st.slider("Gray Columns per Row", 1, 8, 4)
+        with c2:
+            preview_width = st.slider("Gray Preview Width(px)", 80, 900, 220, 20)
+        with c3:
+            preview_count = single_or_slider(
+                "Gray Preview Count",
+                1,
+                len(results),
+                min(len(results), 12),
+                key="gray_preview_count",
+            )
+
+    visible = results[:preview_count]
+    for start in range(0, len(visible), columns_per_row):
+        row_items = visible[start:start + columns_per_row]
+        cols = st.columns(columns_per_row)
+        for col, item in zip(cols, row_items):
+            with col:
+                st.caption(item["name"])
+                st.image(resize_keep_ratio(item["gray"], preview_width), width=preview_width, clamp=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    st.download_button(
+        "Grayscale ZIP 다운로드",
+        data=make_grayscale_zip(results),
+        file_name=f"grayscale_{timestamp}.zip",
+        mime="application/zip",
+    )
+
+    if st.button("Grayscale 로컬 outputs 폴더에 저장"):
+        run_dir = save_grayscale_to_local(results)
+        st.success(f"저장 완료: {run_dir}")
 
 
 def render_colorization_tab(results: List[Dict], params: Dict):
@@ -311,7 +391,7 @@ uploaded_files = st.file_uploader(
 )
 
 if not uploaded_files:
-    st.info("흑백 이미지 여러 장 또는 이미지가 들어있는 ZIP 파일을 업로드하세요.")
+    st.info("실사 RGB 이미지 또는 흑백 이미지 여러 장, 또는 이미지 ZIP 파일을 업로드하세요.")
     st.stop()
 
 images = load_images(uploaded_files)
@@ -322,7 +402,10 @@ if not images:
 params = build_colorization_params()
 results = process_images(images, params)
 
-tab_color, tab_eval, tab_qa = st.tabs(["Colorization", "Evaluation", "Dataset QA"])
+tab_gray, tab_color, tab_eval, tab_qa = st.tabs(["Grayscale Export", "Colorization", "Evaluation", "Dataset QA"])
+
+with tab_gray:
+    render_grayscale_tab(results)
 
 with tab_color:
     render_colorization_tab(results, params)
