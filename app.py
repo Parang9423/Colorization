@@ -11,6 +11,7 @@ import streamlit as st
 from PIL import Image
 
 from src.advisor import generate_dataset_qa_advice, generate_evaluation_advice
+from src.auto_tune import recommend_rgb_balance
 from src.colorization import grayscale_to_rgb_colorize, rgb_to_gray
 from src.dataset_qa import calculate_image_stats, detect_saturation_outliers, summarize_dataset
 from src.evaluation import calculate_delta_e, calculate_psnr, calculate_rgb_histogram_similarity
@@ -148,6 +149,62 @@ def render_advice_panel(title: str, advice_items: List[Dict]):
         st.write(item.get("reason", ""))
         for action in item.get("actions", []):
             st.write(f"- {action}")
+
+
+def render_auto_rgb_recommendation(matched: List[Dict], params: Dict):
+    st.markdown("### Auto RGB Recommendation")
+
+    recommendation = recommend_rgb_balance(matched, params)
+    if not recommendation.get("available"):
+        st.info(recommendation.get("message", "RGB Scale 추천을 생성할 수 없습니다."))
+        return
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Recommended Base Color", recommendation["recommended_base_color"])
+        st.markdown(
+            f"""
+            <div style='width:100%;height:42px;border-radius:8px;border:1px solid #999;background:{recommendation['recommended_base_color']};'></div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.metric("Confidence", recommendation["confidence"])
+    with c3:
+        st.write("Warm/Cool Bias")
+        st.info(recommendation["warmth_bias"])
+
+    st.markdown("#### Recommended RGB Scale")
+    scale_rows = []
+    recommended_scales = recommendation["recommended_scales"]
+    channel_details = recommendation["channel_details"]
+
+    for detail in channel_details:
+        channel_key = f"{detail['channel'].lower()}_scale"
+        scale_rows.append({
+            "channel": detail["channel"],
+            "current_scale": detail["current_scale"],
+            "recommended_scale": recommended_scales[channel_key],
+            "direction": detail["direction_label"],
+            "gt_mean": detail["gt_mean"],
+            "pred_mean": detail["pred_mean"],
+            "ratio": detail["ratio"],
+        })
+
+    st.table(scale_rows)
+
+    st.code(
+        "\n".join([
+            f'base_color = "{recommendation["recommended_base_color"]}"',
+            f'r_scale = {recommended_scales["r_scale"]}',
+            f'g_scale = {recommended_scales["g_scale"]}',
+            f'b_scale = {recommended_scales["b_scale"]}',
+        ]),
+        language="python",
+    )
+
+    with st.expander("Auto RGB Recommendation 상세 정보"):
+        st.json(recommendation)
 
 
 def render_card(item: Dict, mode: str, preview_width: int):
@@ -303,7 +360,7 @@ def match_gt_images(results: List[Dict], gt_images: List[Dict]) -> List[Dict]:
     return matched
 
 
-def render_evaluation_tab(results: List[Dict]):
+def render_evaluation_tab(results: List[Dict], params: Dict):
     st.subheader("Evaluation")
     st.write("실사 GT 이미지와 현재 컬러라이징 결과를 비교합니다. 파일명 기준으로 매칭합니다.")
 
@@ -348,6 +405,7 @@ def render_evaluation_tab(results: List[Dict]):
     st.write("- PSNR: 높을수록 픽셀 단위 차이가 작음")
 
     render_advice_panel("QA Recommendation", generate_evaluation_advice(rows))
+    render_auto_rgb_recommendation(matched, params)
 
     preview_count = single_or_slider(
         "Evaluation Preview Count",
@@ -441,7 +499,7 @@ with tab_color:
     render_colorization_tab(results, params)
 
 with tab_eval:
-    render_evaluation_tab(results)
+    render_evaluation_tab(results, params)
 
 with tab_qa:
     render_dataset_qa_tab(results)
